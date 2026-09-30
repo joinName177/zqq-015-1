@@ -2,7 +2,7 @@ import { IdiomProfile } from '../core/models';
 import { IdiomRepositoryPort } from '../ports/idiom-repository.port';
 import { generateGenericIdiom } from '../core/etymology-engine';
 
-const RICH_IDIOMS: Record<string, IdiomProfile> = {
+export const RICH_IDIOMS: Record<string, IdiomProfile> = {
   '守株待兔': {
     id: 'id-szdt',
     idiom: '守株待兔',

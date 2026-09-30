@@ -1,23 +1,72 @@
-import { IdiomProfile, KinshipResult } from '../core/models';
+import {
+  IdiomProfile,
+  KinshipResult,
+  IdiomRecognitionResult,
+  IdiomCandidate,
+  RecognitionEvidence
+} from '../core/models';
+
+export type AppMode = 'single' | 'compare' | 'recognize';
+
+export interface IdiomViewState {
+  currentProfile: IdiomProfile;
+  presets: string[];
+  mode: AppMode;
+  kinshipResult: KinshipResult | null;
+  compareA: string;
+  compareB: string;
+  recognitionText: string;
+  recognitionResult: IdiomRecognitionResult | null;
+  recognitionError: string | null;
+  queue: IdiomCandidate[];
+  slotA: string | null;
+  slotB: string | null;
+}
 
 export interface IdiomUIHandlers {
   onSearch: (idiomText: string) => void;
   onCompare: (idiomA: string, idiomB: string) => void;
-  onSwitchMode: (mode: 'single' | 'compare') => void;
+  onSwitchMode: (mode: AppMode) => void;
+  onRecognize: (text: string) => void;
+  onRecognitionTextChange: (text: string) => void;
+  onConfirmCandidate: (id: string) => void;
+  onIgnoreCandidate: (id: string) => void;
+  onRestoreCandidate: (id: string) => void;
+  onRemoveFromQueue: (id: string) => void;
+  onAssignQueueSlot: (id: string, slot: 'A' | 'B') => void;
+  onQueueCompare: () => void;
 }
+
+const EVIDENCE_KIND_LABEL: Record<RecognitionEvidence['kind'], string> = {
+  dictionary: '词典',
+  source: '出处',
+  structure: '结构',
+  semantic: '语义',
+  context: '信号'
+};
 
 export function renderIdiomApp(
   container: HTMLElement,
-  currentProfile: IdiomProfile,
-  presets: string[],
-  mode: 'single' | 'compare',
-  kinshipResult: KinshipResult | null,
-  compareA: string,
-  compareB: string,
+  state: IdiomViewState,
   handlers: IdiomUIHandlers
 ) {
   const esc = (s: string) =>
     s.replace(/[&<>'"]/g, t => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[t] || t));
+
+  const {
+    currentProfile,
+    presets,
+    mode,
+    kinshipResult,
+    compareA,
+    compareB,
+    recognitionText,
+    recognitionResult,
+    recognitionError,
+    queue,
+    slotA,
+    slotB
+  } = state;
 
   // DNA Donut Chart SVG
   const dna = currentProfile.dna;
@@ -52,6 +101,171 @@ export function renderIdiomApp(
     </svg>
   `;
 
+  // ---- 古文识别模式渲染 ----
+  const renderHighlightedText = (): string => {
+    const candidates = [...(recognitionResult?.candidates ?? [])].sort((a, b) => a.start - b.start);
+    let html = '';
+    let cursor = 0;
+    for (const c of candidates) {
+      html += esc(recognitionText.slice(cursor, c.start));
+      const cls =
+        c.status === 'confirmed'
+          ? 'mark-confirmed'
+          : c.status === 'ignored'
+            ? 'mark-ignored'
+            : c.tier === 'exact'
+              ? 'mark-exact'
+              : 'mark-tentative';
+      html += `<mark class="idiom-mark ${cls}" data-cand="${c.id}" title="${esc(c.fragment)} · 置信度 ${c.confidence}%">${esc(
+        recognitionText.slice(c.start, c.end)
+      )}</mark>`;
+      cursor = c.end;
+    }
+    html += esc(recognitionText.slice(cursor));
+    return html;
+  };
+
+  const renderCandidateCard = (c: IdiomCandidate): string => {
+    const statusCls =
+      c.status === 'confirmed' ? 'card-confirmed' : c.status === 'ignored' ? 'card-ignored' : '';
+    const tierLabel = c.tier === 'exact' ? '精确匹配' : '待考推测';
+    return `
+      <div class="candidate-card ${statusCls}" data-cand="${c.id}">
+        <div class="cand-head">
+          <span class="cand-fragment">${esc(c.fragment)}</span>
+          <span class="tier-badge ${c.tier}">${tierLabel}</span>
+          <span class="confidence-val">${c.confidence}<small>%</small></span>
+        </div>
+        <div class="confidence-bar">
+          <div class="confidence-fill ${c.tier}" style="width:${c.confidence}%"></div>
+        </div>
+        <ul class="evidence-list">
+          ${c.evidence
+            .map(
+              e => `<li><span class="evidence-kind kind-${e.kind}">${EVIDENCE_KIND_LABEL[e.kind]}</span><span>${esc(
+                e.text
+              )}</span></li>`
+            )
+            .join('')}
+        </ul>
+        <div class="cand-actions">
+          ${
+            c.status === 'confirmed'
+              ? '<button class="btn-confirmed" disabled>✓ 已入对比队列</button>'
+              : c.status === 'ignored'
+                ? `<button class="btn-ghost" data-action="restore" data-id="${c.id}">恢复</button>`
+                : `<button class="btn-confirm" data-action="confirm" data-id="${c.id}">✓ 确认入对比队列</button>
+                   <button class="btn-ghost" data-action="ignore" data-id="${c.id}">忽略</button>`
+          }
+        </div>
+      </div>
+    `;
+  };
+
+  const queueChip = (q: IdiomCandidate, removable: boolean): string => `
+    <span class="queue-chip">
+      <span class="chip-frag">${esc(q.fragment)}</span>
+      <span class="chip-conf">${q.confidence}%</span>
+      ${
+        removable
+          ? `<button class="chip-slot-btn" data-action="slot-a" data-id="${q.id}" title="设为对比甲">甲</button>
+             <button class="chip-slot-btn" data-action="slot-b" data-id="${q.id}" title="设为对比乙">乙</button>
+             <button class="chip-remove" data-action="queue-remove" data-id="${q.id}" title="移出队列">×</button>`
+          : ''
+      }
+    </span>
+  `;
+
+  const exactCount = recognitionResult?.candidates.filter(c => c.tier === 'exact').length ?? 0;
+  const tentativeCount = recognitionResult?.candidates.filter(c => c.tier === 'tentative').length ?? 0;
+  const slotACand = queue.find(q => q.id === slotA);
+  const slotBCand = queue.find(q => q.id === slotB);
+  const bothSlotsFilled = !!slotACand && !!slotBCand;
+
+  const recognizeModeHtml = `
+    <section class="recognize-panel">
+      <div class="section-title">
+        <span>📜 古文段落成语识别 · 标出疑似片段，逐条确认进入对比队列</span>
+      </div>
+      <textarea id="guwenInput" class="guwen-textarea" placeholder="粘贴一段古文（简体、繁体皆可），例如：&#10;夫处世应变，不可刻舟求剑，拘泥成法……">${esc(
+        recognitionText
+      )}</textarea>
+      <div class="recognize-actions">
+        <button class="btn-search" id="btnRecognize">开始识别</button>
+        <button class="btn-secondary" id="btnSample">填入示例段落</button>
+        <button class="btn-ghost" id="btnClearText">清空</button>
+        <span class="lexicon-hint">内置成语词典 · 精确匹配 + 四字格构词特征双策略</span>
+      </div>
+      ${
+        recognitionError
+          ? `<div class="notice-banner notice-error">⚠️ 识别过程出现异常，已保留您粘贴的原文与此前的识别结果。<br><small>${esc(
+              recognitionError
+            )}</small></div>`
+          : ''
+      }
+      ${
+        recognitionResult && recognitionResult.warnings.length > 0
+          ? `<div class="notice-banner notice-warn">${recognitionResult.warnings.map(w => esc(w)).join('<br>')}</div>`
+          : ''
+      }
+    </section>
+
+    ${
+      recognitionResult
+        ? `
+      <section class="recog-stats">
+        <span>全文 ${recognitionResult.textLength} 字</span>
+        <span>扫描汉字 ${recognitionResult.scannedChars} 个</span>
+        <span>候选 ${recognitionResult.candidates.length} 条（精确匹配 ${exactCount} · 待考推测 ${tentativeCount}）</span>
+        <span>已确认 ${queue.length} 条入队列</span>
+      </section>
+
+      <div class="recog-layout">
+        <div class="text-highlight-panel">
+          <div class="panel-label">原文标注（点击高亮片段可定位候选卡片）</div>
+          <div class="guwen-text">${renderHighlightedText()}</div>
+        </div>
+        <div class="candidate-list">
+          <div class="panel-label">疑似成语片段（${recognitionResult.candidates.length}）</div>
+          ${
+            recognitionResult.candidates.length === 0
+              ? '<div class="empty-hint">未在该段落中识别出成语片段，可尝试粘贴包含更多典故成语的段落。</div>'
+              : recognitionResult.candidates.map(renderCandidateCard).join('')
+          }
+        </div>
+      </div>
+    `
+        : `
+      <div class="empty-hint large">粘贴古文段落并点击「开始识别」，系统将标出疑似成语片段、展示置信度与证据，并支持逐条确认进入对比队列。</div>
+    `
+    }
+
+    <section class="queue-panel">
+      <div class="section-title">
+        <span>🧺 对比队列</span>
+      </div>
+      <div class="queue-slots">
+        <div class="queue-slot ${slotACand ? 'filled' : ''}">
+          <span class="slot-label">对比甲</span>
+          ${slotACand ? queueChip(slotACand, false) : '<span class="slot-empty">虚位以待</span>'}
+        </div>
+        <div class="vs-badge small">VS</div>
+        <div class="queue-slot ${slotBCand ? 'filled' : ''}">
+          <span class="slot-label">对比乙</span>
+          ${slotBCand ? queueChip(slotBCand, false) : '<span class="slot-empty">虚位以待</span>'}
+        </div>
+        <button class="btn-search" id="btnQueueCompare" ${bothSlotsFilled ? '' : 'disabled'}>开始亲缘对比演算</button>
+      </div>
+      <div class="queue-chips">
+        ${
+          queue.length === 0
+            ? '<span class="empty-hint">在上方候选卡片中点击「确认入对比队列」，即可将成语加入队列。</span>'
+            : queue.map(q => queueChip(q, true)).join('')
+        }
+      </div>
+    </section>
+  `;
+
   container.innerHTML = `
     <div class="idiom-app">
       <header class="app-header">
@@ -63,14 +277,17 @@ export function renderIdiomApp(
           </div>
         </div>
         <div class="mode-toggle">
-          <button class="mode-btn ${mode === 'single' ? 'active' : ''}" id="btnModeSingle">单词溯源剖析</button>
-          <button class="mode-btn ${mode === 'compare' ? 'active' : ''}" id="btnModeCompare">双词亲缘对比</button>
+          <button class="mode-btn ${mode === 'single' ? 'active' : ''}" data-mode="single">单词溯源剖析</button>
+          <button class="mode-btn ${mode === 'compare' ? 'active' : ''}" data-mode="compare">双词亲缘对比</button>
+          <button class="mode-btn ${mode === 'recognize' ? 'active' : ''}" data-mode="recognize">古文成语识别</button>
         </div>
       </header>
 
       ${
-        mode === 'single'
-          ? `
+        mode === 'recognize'
+          ? recognizeModeHtml
+          : mode === 'single'
+            ? `
         <!-- Single Mode Search Bar -->
         <section class="search-container">
           <div class="search-input-wrap">
@@ -197,7 +414,7 @@ export function renderIdiomApp(
           </aside>
         </div>
       `
-          : `
+            : `
         <!-- Compare Mode -->
         <section class="kinship-arena">
           <div class="section-title">
@@ -267,9 +484,13 @@ export function renderIdiomApp(
     </div>
   `;
 
-  // Attach event listeners
-  container.querySelector('#btnModeSingle')?.addEventListener('click', () => handlers.onSwitchMode('single'));
-  container.querySelector('#btnModeCompare')?.addEventListener('click', () => handlers.onSwitchMode('compare'));
+  // ---- 事件绑定 ----
+  container.querySelectorAll<HTMLElement>('[data-mode]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const m = btn.getAttribute('data-mode') as AppMode | null;
+      if (m) handlers.onSwitchMode(m);
+    });
+  });
 
   if (mode === 'single') {
     const singleInput = container.querySelector('#singleInput') as HTMLInputElement;
@@ -291,12 +512,73 @@ export function renderIdiomApp(
         if (idiom) handlers.onSearch(idiom);
       });
     });
-  } else {
+  } else if (mode === 'compare') {
     container.querySelector('#btnRunCompare')?.addEventListener('click', () => {
       const a = (container.querySelector('#compareInputA') as HTMLInputElement).value.trim();
       const b = (container.querySelector('#compareInputB') as HTMLInputElement).value.trim();
       if (a && b) handlers.onCompare(a, b);
       else alert('请输入需要对比的两个成语');
+    });
+  } else {
+    // 古文识别模式
+    const guwenInput = container.querySelector('#guwenInput') as HTMLTextAreaElement;
+    guwenInput?.addEventListener('input', () => {
+      handlers.onRecognitionTextChange(guwenInput.value);
+    });
+
+    container.querySelector('#btnRecognize')?.addEventListener('click', () => {
+      handlers.onRecognize(guwenInput.value);
+    });
+    guwenInput?.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        handlers.onRecognize(guwenInput.value);
+      }
+    });
+
+    container.querySelector('#btnSample')?.addEventListener('click', () => {
+      const sample =
+        '夫处世应变，不可刻舟求剑，拘泥成法。昔者越王勾践卧薪尝胆，十年生聚，终雪会稽之耻；项羽破釜沉舟，沉船破釜，以示必死，无一还心。若守株待兔，冀侥幸于万一，未有不败者也。';
+      handlers.onRecognitionTextChange(sample);
+      handlers.onRecognize(sample);
+    });
+
+    container.querySelector('#btnClearText')?.addEventListener('click', () => {
+      handlers.onRecognitionTextChange('');
+      if (guwenInput) guwenInput.value = '';
+    });
+
+    container.querySelector('#btnQueueCompare')?.addEventListener('click', () => {
+      if (bothSlotsFilled) handlers.onQueueCompare();
+    });
+
+    // 候选卡片与队列按钮（事件委托）
+    container.querySelectorAll<HTMLElement>('[data-action]').forEach(el => {
+      el.addEventListener('click', () => {
+        const id = el.getAttribute('data-id');
+        const action = el.getAttribute('data-action');
+        if (!id || !action) return;
+        if (action === 'confirm') handlers.onConfirmCandidate(id);
+        else if (action === 'ignore') handlers.onIgnoreCandidate(id);
+        else if (action === 'restore') handlers.onRestoreCandidate(id);
+        else if (action === 'queue-remove') handlers.onRemoveFromQueue(id);
+        else if (action === 'slot-a') handlers.onAssignQueueSlot(id, 'A');
+        else if (action === 'slot-b') handlers.onAssignQueueSlot(id, 'B');
+      });
+    });
+
+    // 点击原文高亮片段 → 定位并闪烁对应候选卡片
+    container.querySelectorAll<HTMLElement>('.idiom-mark').forEach(mark => {
+      mark.addEventListener('click', () => {
+        const id = mark.getAttribute('data-cand');
+        if (!id) return;
+        const card = container.querySelector<HTMLElement>(`.candidate-card[data-cand="${id}"]`);
+        if (card) {
+          card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          card.classList.remove('flash');
+          void card.offsetWidth; // 触发重排以重启动画
+          card.classList.add('flash');
+        }
+      });
     });
   }
 }
